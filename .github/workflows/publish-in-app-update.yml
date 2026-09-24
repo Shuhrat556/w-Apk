@@ -1,0 +1,158 @@
+name: Publish In-App Update
+
+# ============================================================
+# Every new APK here becomes the Farmoish POS in-app update:
+#   - a published Release with an .apk asset (GitHub web UI,
+#     `gh release create`, or the farmoish-pos-app CI — its
+#     PAT-created releases trigger this workflow too)
+#   - an .apk file pushed to main (GitHub rejects files over
+#     100 MB in git; upload bigger APKs as a Release)
+# Forced vs optional: `android_force_update` in the Firebase console.
+# ============================================================
+on:
+  release:
+    types: [published]
+  push:
+    branches:
+      - main
+    paths:
+      - '**.apk'
+
+permissions:
+  contents: write
+
+# One publish at a time; the version check rejects an older APK.
+concurrency:
+  group: publish-in-app-update
+  cancel-in-progress: false
+
+env:
+  FIREBASE_PROJECT_ID: ${{ vars.FIREBASE_PROJECT_ID || 'farmoish-pos' }}
+  APP_PACKAGE: tj.farmoish.pos
+  # SHA-256 of the release signing certificate (farmoish-pos-app
+  # android/app/upload-keystore.jks). Devices reject updates signed otherwise.
+  RELEASE_CERT_SHA256: f5a88f425f25d69fda9a99c6def8312c589f2734e95dcc78622ae719d0da10d4
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+
+    steps:
+      # -------------------------------------------------------
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      # -------------------------------------------------------
+      # Release: its .apk asset. Push: the pushed .apk file.
+      - name: Locate APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG:      ${{ github.event.release.tag_name }}
+          BEFORE:   ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          if [ "$GITHUB_EVENT_NAME" = "release" ]; then
+            NAME="$(gh release view "$TAG" --json assets \
+              --jq '[.assets[].name | select(endswith(".apk"))] | last // empty')"
+            if [ -z "$NAME" ]; then
+              echo "Release $TAG has no .apk asset." >&2
+              exit 1
+            fi
+            gh release download "$TAG" --pattern "$NAME" --dir "$RUNNER_TEMP"
+
+            TAG_URI="$(jq -rn --arg v "$TAG" '$v|@uri')"
+            NAME_URI="$(jq -rn --arg v "$NAME" '$v|@uri')"
+            {
+              echo "APK_PATH=$RUNNER_TEMP/$NAME"
+              echo "APK_URL=https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG_URI}/${NAME_URI}"
+            } >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          if [[ "$BEFORE" =~ ^0+$ ]]; then
+            mapfile -t FILES < <(git show --name-only --diff-filter=AM --format= "$GITHUB_SHA" -- '*.apk')
+          else
+            mapfile -t FILES < <(git diff --name-only --diff-filter=AM "$BEFORE" "$GITHUB_SHA" -- '*.apk')
+          fi
+          if [ "${#FILES[@]}" -ne 1 ]; then
+            echo "Push exactly one new .apk file (found ${#FILES[@]})." >&2
+            exit 1
+          fi
+          echo "APK_PATH=${FILES[0]}" >> "$GITHUB_ENV"
+
+      # -------------------------------------------------------
+      # A wrong package or signing key can't be installed as an update;
+      # catch it here instead of on the devices.
+      - name: Verify APK
+        run: |
+          set -euo pipefail
+          BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+
+          BADGING="$("$BUILD_TOOLS/aapt2" dump badging "$APK_PATH" | head -1)"
+          PACKAGE="$(grep -o " name='[^']*'" <<<"$BADGING" | head -1 | cut -d"'" -f2)"
+          VERSION_CODE="$(grep -o "versionCode='[^']*'" <<<"$BADGING" | head -1 | cut -d"'" -f2)"
+          VERSION_NAME="$(grep -o "versionName='[^']*'" <<<"$BADGING" | head -1 | cut -d"'" -f2)"
+          CERT="$("$BUILD_TOOLS/apksigner" verify --print-certs "$APK_PATH" \
+            | grep -m1 'certificate SHA-256 digest' | awk '{print $NF}')"
+
+          if [ "$PACKAGE" != "$APP_PACKAGE" ]; then
+            echo "APK package is '$PACKAGE', expected '$APP_PACKAGE'." >&2
+            exit 1
+          fi
+          if [ "$CERT" != "$RELEASE_CERT_SHA256" ]; then
+            echo "APK is not signed with the release key (got '${CERT:-none}')." >&2
+            echo "Build it on a machine that has android/key.properties." >&2
+            exit 1
+          fi
+
+          {
+            echo "VERSION_CODE=$VERSION_CODE"
+            echo "VERSION_NAME=$VERSION_NAME"
+          } >> "$GITHUB_ENV"
+          echo "APK OK: $PACKAGE $VERSION_NAME ($VERSION_CODE)"
+
+      # -------------------------------------------------------
+      # Pushed file → Release asset, so every update is listed under Releases.
+      # (GITHUB_TOKEN-created releases don't re-trigger this workflow.)
+      - name: Create Release for Pushed APK
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="pos-v${VERSION_NAME}-${VERSION_CODE}"
+          NAME="farmoish-pos-${VERSION_NAME}-${VERSION_CODE}.apk"
+          cp "$APK_PATH" "$RUNNER_TEMP/$NAME"
+
+          gh release create "$TAG" "$RUNNER_TEMP/$NAME" \
+            --target "$GITHUB_SHA" \
+            --title "Farmoish POS ${VERSION_NAME}+${VERSION_CODE}" \
+            --notes "Pushed file: ${APK_PATH}"
+
+          echo "APK_URL=https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${NAME}" >> "$GITHUB_ENV"
+
+      # -------------------------------------------------------
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # -------------------------------------------------------
+      # Installed apps pick the new version up within seconds
+      # (real-time Remote Config) and show the update prompt.
+      - name: Publish to Remote Config
+        env:
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          if [ -z "$FIREBASE_SERVICE_ACCOUNT_JSON" ]; then
+            echo "FIREBASE_SERVICE_ACCOUNT_JSON secret is missing." >&2
+            exit 1
+          fi
+
+          pip install --quiet google-auth requests
+          python .github/scripts/publish_in_app_update.py
